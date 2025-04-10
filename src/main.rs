@@ -7,12 +7,13 @@ use std::fmt::Debug;
 use std::ops::DerefMut;
 use std::str::FromStr;
 use tokio::sync::Mutex;
+use tokio::net::TcpStream;
 
 struct Handler {
     prefix: String,
     connector: Box<dyn Connector + Send + Sync>,
     command: Option<String>,
-    connection: Mutex<Connection>,
+    connection: Mutex<Connection<TcpStream>>,
     role: Option<RoleId>,
     channel: Option<ChannelId>,
 }
@@ -277,8 +278,8 @@ struct SimpleConnector {
 
 #[async_trait]
 impl Connector for SimpleConnector {
-    async fn connect(&self) -> rcon::Result<Connection> {
-        let mut builder = Connection::builder();
+    async fn connect(&self) -> rcon::Result<Connection<TcpStream>> {
+        let mut builder = <Connection<TcpStream>>::builder();
         match self.server_kind {
             ServerKind::Normal => {}
             ServerKind::Minecraft => builder = builder.enable_minecraft_quirks(true),
@@ -290,5 +291,5 @@ impl Connector for SimpleConnector {
 
 #[async_trait]
 trait Connector {
-    async fn connect(&self) -> rcon::Result<Connection>;
+    async fn connect(&self) -> rcon::Result<Connection<TcpStream>>;
 }

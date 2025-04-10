@@ -1,12 +1,12 @@
 [package]
 name = "discord-rcon"
-version = "0.1.7-SNAPSHOT"
-edition = "2018"
+version = "0.1.8"
+edition = "2024"
 license = "Apache-2.0 OR MIT"
 readme = "README.md"
 description = "The discord bot to control game servers via rcon."
 repository = "https://github.com/anatawa12/discord-rcon"
-authors = ["anatawa12 <anatawa12@icloud.com>"]
+authors = ["anatawa12 <anatawa12@icloud.com>", "Dimaguy <dima@linkpuff.me>"]
 
 categories = ["games"]
 keywords = ["rcon", "discord", "bot", "rcon", "minecraft"]
@@ -18,7 +18,7 @@ include = [
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rcon = "0"
+rcon = { version = "0", features = ["rt-tokio"] }
 toml = "0.5"
 tokio = { version = "1.16.1", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1", features = [ "derive" ] }
