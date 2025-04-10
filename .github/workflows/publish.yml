@@ -24,7 +24,7 @@ jobs:
       - name: update version name
         id: update
         run: |-
-          set-git-user anatawa12-bot
+          set-git-user ReconnectedCC-bot
 
           # update version name
           VERSION="$(get-version)"
@@ -115,7 +115,7 @@ jobs:
         uses: docker/login-action@v1
         with:
           registry: ghcr.io
-          username: anatawa12
+          username: dimaguy
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/download-artifact@v2
@@ -136,13 +136,13 @@ jobs:
           # linux/ppc64le
           # linux/s390x
           tags: |-
-            ghcr.io/anatawa12/discord-rcon:latest
-            ghcr.io/anatawa12/discord-rcon:${{ needs.setup.outputs.version }}
+            ghcr.io/ReconnectedCC/discord-rcon:latest
+            ghcr.io/ReconnectedCC/discord-rcon:${{ needs.setup.outputs.version }}
 
-      - name: Publish CARGO
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: cargo publish --no-verify # it's verified on cargo package so no-verify
+#      - name: Publish CARGO
+#        env:
+#          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+#        run: cargo publish --no-verify # it's verified on cargo package so no-verify
 
       - name: Push tag
         env:
