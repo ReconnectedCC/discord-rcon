@@ -4,16 +4,17 @@ use serenity::async_trait;
 use serenity::model::prelude::*;
 use serenity::prelude::*;
 use std::fmt::Debug;
-use std::ops::DerefMut;
 use std::str::FromStr;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
 use tokio::net::TcpStream;
+use std::sync::Arc;
+use rand::Rng;
 
 struct Handler {
     prefix: String,
-    connector: Box<dyn Connector + Send + Sync>,
+    connector: Arc<dyn Connector + Send + Sync>,
     command: Option<String>,
-    connection: Mutex<Connection<TcpStream>>,
+    rcon: Arc<RconManager>,
     role: Option<RoleId>,
     channel: Option<ChannelId>,
 }
@@ -58,21 +59,9 @@ impl EventHandler for Handler {
             match iterator.next() {
                 Some("reconnect") => {
                     print_err(message.channel_id.say(&ctx.http, "reconnecting ...").await);
-                    match self.connector.connect().await {
-                        Ok(connection) => {
-                            *self.connection.lock().await.deref_mut() = connection;
-                            print_err(message.channel_id.say(&ctx.http, "reconnected").await);
-                        }
-                        Err(err) => {
-                            print_err(
-                                message
-                                    .channel_id
-                                    .say(&ctx.http, format!("error connecting to server: {}\nold connection still used.", err))
-                                    .await,
-                            );
-                        }
-                    }
-                    panic!("manually stop")
+                    // signal background task to reconnect immediately
+                    self.rcon.request_reconnect().await;
+                    print_err(message.channel_id.say(&ctx.http, "reconnect requested; check logs.").await);
                 }
                 _ => {
                     print_err(
@@ -87,7 +76,7 @@ impl EventHandler for Handler {
             let command = command.trim();
             println!("run command: {}", command);
 
-            match { (*self.connection.lock().await).cmd(command).await } {
+            match self.rcon.run_command(command).await {
                 Ok(res) => {
                     println!("response: {}", res);
                     print_err(
@@ -135,13 +124,18 @@ async fn main() {
         pass: options.rcon.pass.clone(),
     };
 
+    let connector_arc: Arc<dyn Connector + Send + Sync> = Arc::new(connector);
+
+    let rcon = Arc::new(RconManager::new(connector_arc.clone(), options.backoff.clone()).await.expect("failed to create manager"));
+
     let handler = Handler {
         prefix: options.prefix,
         command: options.command,
         role: options.role.map(RoleId),
         channel: options.channel.map(ChannelId),
-        connection: Mutex::new(connector.connect().await.expect("failed to connect")),
-        connector: Box::new(connector),
+        // keep connector for manual low-level reconnects if needed
+        connector: connector_arc.clone(),
+        rcon: rcon.clone(),
     };
 
     let mut client = Client::builder(&options.token)
@@ -178,6 +172,36 @@ async fn read_options() -> Options {
 fn read_options_from_env() -> Result<Options, &'static str> {
     use std::env;
 
+    // helper to parse optional u64 / u32 / f64 from env and fallback to default
+    let default_backoff = RconBackoffConfig::default();
+
+    let base_delay_ms = env::var("RCON_BASE_DELAY_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default_backoff.base_delay_ms);
+
+    let max_delay_ms = env::var("RCON_MAX_DELAY_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default_backoff.max_delay_ms);
+
+    let max_retries = match env::var("RCON_MAX_RETRIES") {
+        Ok(s) => {
+            let sl = s.to_lowercase();
+            if sl == "none" || sl == "" {
+                None
+            } else {
+                s.parse::<u32>().ok()
+            }
+        }
+        Err(_) => default_backoff.max_retries,
+    };
+
+    let jitter_fraction = env::var("RCON_JITTER_FRACTION")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(default_backoff.jitter_fraction);
+
     Ok(Options {
         token: env::var("DISCORD_TOKEN").map_err(|_| "DISCORD_TOKEN")?,
         prefix: env::var("DISCORD_PREFIX").map_err(|_| "DISCORD_PREFIX")?,
@@ -197,6 +221,12 @@ fn read_options_from_env() -> Result<Options, &'static str> {
             pass: env::var("RCON_PASSWORD")
                 .ok()
                 .unwrap_or_else(Default::default),
+        },
+        backoff: RconBackoffConfig {
+            base_delay_ms,
+            max_delay_ms,
+            max_retries,
+            jitter_fraction,
         },
     })
 }
@@ -218,6 +248,8 @@ struct Options {
     #[serde(default)]
     server_kind: ServerKind,
     rcon: RconOptions,
+    #[serde(default)]
+    backoff: RconBackoffConfig,
 }
 
 #[derive(Deserialize)]
@@ -292,4 +324,145 @@ impl Connector for SimpleConnector {
 #[async_trait]
 trait Connector {
     async fn connect(&self) -> rcon::Result<Connection<TcpStream>>;
+}
+
+// New: backoff config and manager
+
+#[derive(Clone, Deserialize)]
+struct RconBackoffConfig {
+    base_delay_ms: u64,
+    max_delay_ms: u64,
+    max_retries: Option<u32>,
+    jitter_fraction: f64,
+}
+
+impl Default for RconBackoffConfig {
+    fn default() -> Self {
+        RconBackoffConfig {
+            base_delay_ms: 500,
+            max_delay_ms: 30_000,
+            max_retries: None,
+            jitter_fraction: 0.3,
+        }
+    }
+}
+
+struct RconManager {
+    request_tx: mpsc::Sender<ManagerRequest>,
+}
+
+enum ManagerRequest {
+    Command { cmd: String, resp: oneshot::Sender<Result<String, String>> },
+    Reconnect,
+}
+
+impl RconManager {
+    async fn new(connector: Arc<dyn Connector + Send + Sync>, backoff: RconBackoffConfig) -> Result<Self, String> {
+        // create channel and spawn manager task that owns Connection
+        let (tx, mut rx) = mpsc::channel::<ManagerRequest>(32);
+
+        // attempt initial connect inside the task
+        let connector_task = connector.clone();
+
+        // Spawn a dedicated OS thread running a current-thread Tokio runtime so the manager
+        // can own non-Send connection types.
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build runtime for rcon manager");
+
+            rt.block_on(async move {
+                // owned connection inside the task
+                let mut conn: Option<Connection<TcpStream>> = match connector_task.connect().await {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        println!("initial connect failed: {}", e);
+                        None
+                    }
+                };
+
+                // state for backoff
+                let mut backoff_cfg = backoff.clone();
+
+                // helper to perform reconnect with backoff
+                async fn do_reconnect(connector: &Arc<dyn Connector + Send + Sync>, backoff: &RconBackoffConfig) -> Option<Connection<TcpStream>> {
+                    let mut attempt: u32 = 0;
+                    loop {
+                        if let Some(max) = backoff.max_retries {
+                            if attempt >= max {
+                                println!("max retries reached ({}) - giving up", max);
+                                return None;
+                            }
+                        }
+                        let pow = 2u64.saturating_pow(attempt);
+                        let mut backoff_ms = backoff.base_delay_ms.saturating_mul(pow);
+                        if backoff_ms > backoff.max_delay_ms {
+                            backoff_ms = backoff.max_delay_ms;
+                        }
+                        let mut rng = rand::thread_rng();
+                        let jitter_range = (backoff_ms as f64 * backoff.jitter_fraction) as i64;
+                        let jitter = if jitter_range > 0 { rng.gen_range(-(jitter_range)..=(jitter_range)) as i64 } else { 0 };
+                        let sleep_ms = if jitter < 0 { backoff_ms.saturating_sub((-jitter) as u64) } else { backoff_ms.saturating_add(jitter as u64) };
+                        println!("reconnect attempt {} - sleeping {} ms", attempt + 1, sleep_ms);
+                        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                        match connector.connect().await {
+                            Ok(c) => return Some(c),
+                            Err(e) => {
+                                println!("reconnect failed: {}", e);
+                                attempt = attempt.saturating_add(1);
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                while let Some(req) = rx.recv().await {
+                    match req {
+                        ManagerRequest::Command { cmd, resp } => {
+                            if let Some(ref mut c) = conn {
+                                match c.cmd(&cmd).await {
+                                    Ok(res) => {
+                                        let _ = resp.send(Ok(res));
+                                    }
+                                    Err(e) => {
+                                        println!("command failed: {}", e);
+                                        // drop connection and try to reconnect
+                                        conn = None;
+                                        // attempt reconnect
+                                        conn = do_reconnect(&connector_task, &backoff_cfg).await;
+                                        let _ = resp.send(Err(format!("rcon error: {}", e)));
+                                    }
+                                }
+                            } else {
+                                // no connection - attempt reconnect then return error
+                                conn = do_reconnect(&connector_task, &backoff_cfg).await;
+                                let _ = resp.send(Err("not connected to rcon server".into()));
+                            }
+                        }
+                        ManagerRequest::Reconnect => {
+                            // trigger reconnect
+                            println!("manual reconnect requested");
+                            conn = do_reconnect(&connector_task, &backoff_cfg).await;
+                        }
+                    }
+                }
+
+                println!("manager task exiting");
+            })
+        });
+
+        Ok(RconManager { request_tx: tx })
+    }
+
+    async fn request_reconnect(&self) {
+        let _ = self.request_tx.send(ManagerRequest::Reconnect).await;
+    }
+
+    async fn run_command(&self, cmd: &str) -> Result<String, String> {
+        let (tx, rx) = oneshot::channel();
+        let req = ManagerRequest::Command { cmd: cmd.to_string(), resp: tx };
+        self.request_tx.send(req).await.map_err(|e| format!("manager task stopped: {}", e))?;
+        rx.await.map_err(|e| format!("response channel closed: {}", e))?
+    }
 }

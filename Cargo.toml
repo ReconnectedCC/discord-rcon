@@ -20,8 +20,10 @@ include = [
 [dependencies]
 rcon = { version = "0", features = ["rt-tokio"] }
 toml = "0.5"
-tokio = { version = "1.16.1", features = ["macros", "rt-multi-thread"] }
+# use multi-threaded tokio runtime
+tokio = { version = "1.16.1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 serde = { version = "1", features = [ "derive" ] }
+rand = "0.8"
 
 [dependencies.serenity]
 version = "0.10"
