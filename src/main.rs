@@ -58,17 +58,18 @@ impl EventHandler for Handler {
             let mut iterator = command.split_whitespace();
             match iterator.next() {
                 Some("reconnect") => {
-                    print_err(message.channel_id.say(&ctx.http, "reconnecting ...").await);
+                    print_err(send_long_message(&ctx.http, message.channel_id, "reconnecting ...".to_string()).await);
                     // signal background task to reconnect immediately
                     self.rcon.request_reconnect().await;
-                    print_err(message.channel_id.say(&ctx.http, "reconnect requested; check logs.").await);
+                    print_err(send_long_message(&ctx.http, message.channel_id, "reconnect requested; check logs.".to_string()).await);
                 }
                 _ => {
                     print_err(
-                        message
-                            .channel_id
-                            .say(&ctx.http, format!("unknown command: {}", command))
-                            .await,
+                        send_long_message(
+                            &ctx.http,
+                            message.channel_id,
+                            format!("unknown command: {}", command)
+                        ).await
                     );
                 }
             }
@@ -80,22 +81,21 @@ impl EventHandler for Handler {
                 Ok(res) => {
                     println!("response: {}", res);
                     print_err(
-                        message
-                            .channel_id
-                            .say(&ctx.http, format!("response from server: \n{}", res))
-                            .await,
+                        send_long_message(
+                            &ctx.http,
+                            message.channel_id,
+                            format!("response from server: \n{}", res)
+                        ).await
                     );
                 }
                 Err(err) => {
                     println!("error    : {}", err);
                     print_err(
-                        message
-                            .channel_id
-                            .say(
-                                &ctx.http,
-                                format!("error during sending message: \n{}", err),
-                            )
-                            .await,
+                        send_long_message(
+                            &ctx.http,
+                            message.channel_id,
+                            format!("error during sending message: \n{}", err)
+                        ).await
                     );
                 }
             }
@@ -111,6 +111,129 @@ fn print_err<T, R: Debug>(result: Result<T, R>) -> () {
     if let Some(err) = result.err() {
         println!("error: {:?}", err)
     }
+}
+
+/// Split a message into chunks that fit within Discord's 2000 character limit
+fn split_message(message: &str, max_length: usize) -> Vec<String> {
+    if message.len() <= max_length {
+        return vec![message.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current_chunk = String::new();
+
+    for line in message.lines() {
+        // If a single line is longer than max_length, split it by characters
+        if line.len() > max_length {
+            // Flush current chunk if not empty
+            if !current_chunk.is_empty() {
+                chunks.push(current_chunk.clone());
+                current_chunk.clear();
+            }
+
+            // Split the long line into character chunks
+            let mut chars_remaining = line;
+            while !chars_remaining.is_empty() {
+                let split_at = chars_remaining.char_indices()
+                    .nth(max_length)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(chars_remaining.len());
+                chunks.push(chars_remaining[..split_at].to_string());
+                chars_remaining = &chars_remaining[split_at..];
+            }
+            continue;
+        }
+
+        // Check if adding this line would exceed the limit
+        let line_with_newline = if current_chunk.is_empty() {
+            line
+        } else {
+            // Account for the newline character
+            if current_chunk.len() + line.len() + 1 > max_length {
+                chunks.push(current_chunk.clone());
+                current_chunk.clear();
+                line
+            } else {
+                current_chunk.push('\n');
+                line
+            }
+        };
+
+        current_chunk.push_str(line_with_newline);
+    }
+
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
+    }
+
+    // Ensure we have at least one chunk
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+
+    chunks
+}
+
+/// Send a message to Discord with automatic rate limit handling
+async fn send_discord_message(
+    http: &serenity::http::Http,
+    channel_id: ChannelId,
+    content: String,
+) -> serenity::Result<Message> {
+    let mut retry_count = 0;
+    const MAX_RETRIES: u32 = 5;
+
+    loop {
+        match channel_id.say(http, &content).await {
+            Ok(msg) => return Ok(msg),
+            Err(serenity::Error::Http(http_err)) => {
+                // Check if it's a rate limit error (429)
+                if let serenity::http::HttpError::UnsuccessfulRequest(response) = http_err.as_ref() {
+                    if response.status_code == serenity::http::StatusCode::TOO_MANY_REQUESTS {
+                        retry_count += 1;
+                        if retry_count > MAX_RETRIES {
+                            println!("max retries exceeded for rate limit");
+                            return Err(serenity::Error::Http(http_err));
+                        }
+
+                        // Use exponential backoff: 1s, 2s, 4s, 8s, 16s
+                        let retry_after_ms = 1000u64 * (1 << retry_count.min(4));
+
+                        println!("rate limited (429), retrying after {} ms (attempt {}/{})",
+                                 retry_after_ms, retry_count, MAX_RETRIES);
+                        tokio::time::sleep(std::time::Duration::from_millis(retry_after_ms)).await;
+                        continue;
+                    }
+                }
+                return Err(serenity::Error::Http(http_err));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Send a potentially long message, splitting it if necessary and handling rate limits
+async fn send_long_message(
+    http: &serenity::http::Http,
+    channel_id: ChannelId,
+    content: String,
+) -> serenity::Result<()> {
+    const DISCORD_MAX_LENGTH: usize = 2000;
+    let chunks = split_message(&content, DISCORD_MAX_LENGTH);
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        if chunks.len() > 1 {
+            println!("sending message part {}/{}", i + 1, chunks.len());
+        }
+        send_discord_message(http, channel_id, chunk.clone()).await?;
+
+        // Add a small delay between chunks to avoid rate limits
+        if i < chunks.len() - 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
